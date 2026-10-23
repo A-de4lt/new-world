@@ -7,18 +7,29 @@ const path = require('path');
 const app = express();
 const PORT = 3000;
 const SALT_ROUNDS = 10;
-const LOGIN_EXPIRE_MS = 30 * 60 * 1000; // 30分钟超时
+const LOGIN_EXPIRE_MS = 30 * 60 * 1000;
+
+// ========== CORS跨域配置（核心，允许github pages访问接口） ==========
+app.use((req, res, next) => {
+  // 允许你的github pages域名
+  res.header('Access-Control-Allow-Origin', 'https://a-de4lt.github.io');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 app.use(cookieParser());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
 const db = new sqlite3.Database('./database.db', (err) => {
   if (err) console.error('数据库错误：', err.message);
   else console.log('数据库连接成功');
 });
 
-// 用户表，新增 last_active 用来做超时校验
 db.run(`CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
@@ -27,7 +38,7 @@ db.run(`CREATE TABLE IF NOT EXISTS users (
   last_active INTEGER
 )`);
 
-// 初始化管理员，密码加密存入
+// 初始化管理员账号 admin / 123456
 db.get("SELECT * FROM users WHERE username='admin'", async (err, row) => {
   if (!row) {
     const hashPwd = await bcrypt.hash('123456', SALT_ROUNDS);
@@ -36,8 +47,7 @@ db.get("SELECT * FROM users WHERE username='admin'", async (err, row) => {
   }
 });
 
-// ========== 工具中间件 ==========
-// 校验登录 + 刷新活跃时间，超时自动失效
+// 登录校验中间件
 async function authCheck(req, res, next) {
   const uid = req.cookies.uid;
   const role = req.cookies.role;
@@ -53,14 +63,12 @@ async function authCheck(req, res, next) {
       res.clearCookie('username');
       return res.json({ code: -2, msg: '登录已超时，请重新登录' });
     }
-    // 更新最后活跃时间
     db.run("UPDATE users SET last_active=? WHERE id=?", [now, uid]);
     req.user = user;
     next();
   })
 }
 
-// 管理员权限
 function adminOnly(req, res, next) {
   if (req.user.role !== 'admin') {
     return res.json({ code: 0, msg: '无管理员权限' });
@@ -68,8 +76,7 @@ function adminOnly(req, res, next) {
   next();
 }
 
-// ========== 接口 ==========
-// 注册
+// 注册接口
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.json({ code: 0, msg: '账号密码不能为空' });
@@ -85,31 +92,30 @@ app.post('/api/register', async (req, res) => {
   }
 })
 
-// 登录
+// 登录接口
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   db.get("SELECT * FROM users WHERE username=?", [username], async (err, user) => {
     if (err || !user) return res.json({ code: 0, msg: '账号或密码错误' });
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.json({ code: 0, msg: '账号或密码错误' });
-    // 更新活跃时间
     db.run("UPDATE users SET last_active=? WHERE id=?", [Date.now(), user.id]);
-    res.cookie('uid', user.id, { maxAge: LOGIN_EXPIRE_MS });
-    res.cookie('role', user.role, { maxAge: LOGIN_EXPIRE_MS });
-    res.cookie('username', user.username, { maxAge: LOGIN_EXPIRE_MS });
+    res.cookie('uid', user.id, { maxAge: LOGIN_EXPIRE_MS, sameSite:'none', secure:true });
+    res.cookie('role', user.role, { maxAge: LOGIN_EXPIRE_MS, sameSite:'none', secure:true });
+    res.cookie('username', user.username, { maxAge: LOGIN_EXPIRE_MS, sameSite:'none', secure:true });
     res.json({ code: 1, role: user.role, msg: '登录成功' });
   })
 })
 
-// 登出
+// 退出登录
 app.get('/api/logout', (req, res) => {
-  res.clearCookie('uid');
-  res.clearCookie('role');
-  res.clearCookie('username');
-  res.redirect('/login.html');
+  res.clearCookie('uid', {sameSite:'none', secure:true});
+  res.clearCookie('role', {sameSite:'none', secure:true});
+  res.clearCookie('username', {sameSite:'none', secure:true});
+  res.json({code:1, msg:'已退出'});
 })
 
-// 获取用户列表（分页+搜索）
+// 用户列表
 app.get('/api/userlist', authCheck, adminOnly, (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const pageSize = 8;
@@ -126,7 +132,7 @@ app.get('/api/userlist', authCheck, adminOnly, (req, res) => {
   sql += " LIMIT ? OFFSET ?";
   params.push(pageSize, offset);
 
-  db.get(countSql, params.slice(0, keyword ? 1 : 0), (err, cntRow) => {
+  db.get(countSql, params.slice(0, keyword?1:0), (err, cntRow) => {
     db.all(sql, params, (err, list) => {
       res.json({
         code: 1,
@@ -151,7 +157,7 @@ app.post('/api/deluser', authCheck, adminOnly, (req, res) => {
   })
 })
 
-// 管理员：修改用户名
+// 修改用户名
 app.post('/api/admin-edit-name', authCheck, adminOnly, (req, res) => {
   const { id, newName } = req.body;
   db.run("UPDATE users SET username=? WHERE id=?", [newName, id], err => {
@@ -160,7 +166,7 @@ app.post('/api/admin-edit-name', authCheck, adminOnly, (req, res) => {
   })
 })
 
-// 管理员：重置用户密码
+// 管理员重置密码
 app.post('/api/admin-reset-pwd', authCheck, adminOnly, async (req, res) => {
   const { id, newPwd } = req.body;
   const hash = await bcrypt.hash(newPwd, SALT_ROUNDS);
@@ -170,7 +176,7 @@ app.post('/api/admin-reset-pwd', authCheck, adminOnly, async (req, res) => {
   })
 })
 
-// 普通用户：自己修改密码
+// 用户自己修改密码
 app.post('/api/user-change-pwd', authCheck, async (req, res) => {
   const { oldPwd, newPwd } = req.body;
   const user = req.user;
@@ -183,18 +189,6 @@ app.post('/api/user-change-pwd', authCheck, async (req, res) => {
   })
 })
 
-// ========== 页面权限路由 ==========
-function guardPage(allowRole) {
-  return (req, res) => {
-    const role = req.cookies.role;
-    if (!role || !allowRole.includes(role)) return res.redirect('/login.html');
-    res.sendFile(path.join(__dirname, 'public', req.path));
-  }
-}
-app.get('/index.html', guardPage(['user']));
-app.get('/admin.html', guardPage(['admin']));
-app.get('/user-setting.html', guardPage(['user']));
-
 app.listen(PORT, () => {
-  console.log(`服务启动：http://localhost:${PORT}`);
+  console.log(`后端接口服务启动：http://127.0.0.1:${PORT}`);
 })
